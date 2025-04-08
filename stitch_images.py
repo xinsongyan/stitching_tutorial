@@ -57,9 +57,9 @@ def resize_images(imgs):
     final_imgs = list(images.resize(Images.Resolution.FINAL))
     return medium_imgs, low_imgs, final_imgs
 
-def detect_features(imgs, debug=False):
+def detect_features(imgs, detector='sift', debug=False):
 
-    detector = FeatureDetector()
+    detector = FeatureDetector(detector=detector)
     features = [detector.detect_features(img) for img in imgs]
     keypoints_imgs = [detector.draw_keypoints(img, feature) for img, feature in zip(imgs, features)]
     if debug:
@@ -81,10 +81,10 @@ def match_features(imgs, features, debug=False):
             plot_image(img, (20,10), f'Matches Image {idx1+1} to Image {idx2+1}')
     return matches
 
-def subset_images(images, features, matches):
+def subset_images(images, features, matches, confidence_threshold=0.2):
     from stitching.subsetter import Subsetter
 
-    subsetter = Subsetter()
+    subsetter = Subsetter(confidence_threshold=confidence_threshold)
     dot_notation = subsetter.get_matches_graph(images.names, matches)
     print(dot_notation)
 
@@ -217,30 +217,64 @@ def blend_images(cropped_imgs, seam_masks, cropped_corners, cropped_sizes, debug
         plot_image(panorama, (10, 10), 'Final Panorama')
     return panorama
 
-if __name__ == "__main__":
 
+def main1():
+    img_paths = get_image_paths('fish')
+    images = Images.of(img_paths)
 
-    weir_imgs = get_image_paths('weir')
-    images = Images.of(weir_imgs)
+    plot_images(list(images), (20, 20), 'Original Images')
 
-    plot_images(weir_imgs, (20, 20), 'Original Images')
-
-    features = detect_features(images, debug=True)
+    features = detect_features(images, detector='sift', debug=True)
 
     matches = match_features(images, features, debug=True)
 
-    subset_images(images, features, matches)
+    subset_images(images, features, matches, confidence_threshold=0.2)
 
     cameras = estimate_cameras(features, matches)
 
-    warped_final_imgs, warped_final_masks, final_corners, final_sizes = warp_images(images, cameras, debug=True)
+    warped_final_imgs, warped_final_masks, warped_corners, warped_sizes = warp_images(images, cameras, debug=True)
 
-    timelapse_images(warped_final_imgs, final_corners, final_sizes)
+    timelapse_images(warped_final_imgs, warped_corners, warped_sizes)
 
-    cropped_imgs, cropped_masks, cropped_corners, cropped_sizes = crop_images(warped_final_imgs, warped_final_masks, final_corners, final_sizes, debug=True)
+    cropped_imgs, cropped_masks, cropped_corners, cropped_sizes = crop_images(warped_final_imgs, warped_final_masks, warped_corners, warped_sizes, debug=True)
 
     seam_masks = seam_images(cropped_imgs, cropped_masks, cropped_corners, cropped_sizes, debug=True)
 
     panorama = blend_images(cropped_imgs, seam_masks, cropped_corners, cropped_sizes, debug=True)
 
     plt.show(block=True)
+
+def main2():
+    from stitching import Stitcher
+
+    img_paths = get_image_paths('fish')
+    images = Images.of(img_paths)
+
+    stitcher = Stitcher(detector='sift', confidence_threshold=0.2, matcher_type='affine')
+    panorama = stitcher.stitch(img_paths)
+    plot_image(panorama, (20,20))
+    plt.savefig('panorama_stitcher.png', dpi=300)
+    plt.show(block=True)
+
+def main3():
+    from stitching import AffineStitcher
+
+    img_paths = get_image_paths('fish')
+    images = Images.of(img_paths)
+
+    settings = {
+                "detector": 'sift',
+                "confidence_threshold": 0.3,
+                "crop": False,
+                }    
+    stitcher = AffineStitcher(**settings)
+    panorama = stitcher.stitch(img_paths)
+
+    plot_image(panorama, (20,20))
+    plt.savefig('panorama_affine_stitcher.png', dpi=300)
+    plt.show(block=True)
+
+if __name__ == "__main__":
+    # main1()
+    # main2()
+    main3()
