@@ -7,17 +7,18 @@ from pathlib import Path
 import cv2 as cv
 import numpy as np
 
-
+from stitching.images import Images
 from stitching.feature_detector import FeatureDetector
 from stitching.feature_matcher import FeatureMatcher
 
 def get_image_paths(img_set):
     return [str(path.relative_to('.')) for path in Path('imgs').rglob(f'{img_set}*')]
 
-def plot_image(img, figsize_in_inches=(5,5)):
-    fig, ax = plt.subplots(figsize=figsize_in_inches)
+def plot_image(img, figsize_in_inches=(5, 5), figure_title=None):
+    fig, ax = plt.subplots(figsize=figsize_in_inches, num=figure_title)
     ax.imshow(cv.cvtColor(img, cv.COLOR_BGR2RGB))
-    plt.show()
+    plt.tight_layout()
+    plt.show(block=False)
     
 def plot_images(imgs, figsize_in_inches=(5, 5), figure_title=None):
     """
@@ -68,32 +69,178 @@ def detect_features(imgs, debug=False):
 def match_features(imgs, features, debug=False):
     matcher = FeatureMatcher()
     matches = matcher.match_features(features)
-    matcher.get_confidence_matrix(matches)
+    print("Confidence Matrix:\n", matcher.get_confidence_matrix(matches))
+
     if debug:
         # Convert the generator to a list
-        all_relevant_matches = list(matcher.draw_matches_matrix(imgs, features, matches, conf_thresh=1, 
-                                                                inliers=True, matchColor=(0, 255, 0)))
-        fig, axs = plt.subplots(len(all_relevant_matches), 1, figsize=(20, 10 * len(all_relevant_matches)))
-        for i, (idx1, idx2, img) in enumerate(all_relevant_matches):
-            axs[i].imshow(cv.cvtColor(img, cv.COLOR_BGR2RGB))
-            axs[i].text(
-                0.5, 0.95, f"Matches Image {idx1+1} to Image {idx2+1}",
-                fontsize=12, color='black', ha='center', va='bottom', transform=axs[i].transAxes,
-                bbox=dict(facecolor='white', edgecolor='none', alpha=0.7)
-            )
-            axs[i].axis('off')
+        all_relevant_matches = matcher.draw_matches_matrix(list(imgs), features, matches, conf_thresh=1, 
+                                                                inliers=True, matchColor=(0, 255, 0))
+        
+        for idx1, idx2, img in all_relevant_matches:
+            # print(f"Matches Image {idx1+1} to Image {idx2+1}")
+            plot_image(img, (20,10), f'Matches Image {idx1+1} to Image {idx2+1}')
+    return matches
+
+def subset_images(images, features, matches):
+    from stitching.subsetter import Subsetter
+
+    subsetter = Subsetter()
+    dot_notation = subsetter.get_matches_graph(images.names, matches)
+    print(dot_notation)
+
+    indices = subsetter.get_indices_to_keep(features, matches)
+
+    images.subset(indices)
+    features = subsetter.subset_list(features, indices)
+    matches = subsetter.subset_matches(matches, indices)
+
+    print(images.names)
+    print("Confidence Matrix:\n", FeatureMatcher().get_confidence_matrix(matches))
+
+def estimate_cameras(features, matches):
+    from stitching.camera_estimator import CameraEstimator
+    from stitching.camera_adjuster import CameraAdjuster
+    from stitching.camera_wave_corrector import WaveCorrector
+
+    camera_estimator = CameraEstimator()
+    camera_adjuster = CameraAdjuster()
+    wave_corrector = WaveCorrector()
+
+    cameras = camera_estimator.estimate(features, matches)
+    cameras = camera_adjuster.adjust(features, matches, cameras)
+    cameras = wave_corrector.correct(cameras)
+    return cameras
+
+
+def warp_images(images, cameras, debug=False):
+    from stitching.warper import Warper
+    warper = Warper()
+    warper.set_scale(cameras)
+
+    final_sizes = images.get_scaled_img_sizes(Images.Resolution.FINAL)
+    warped_final_imgs = warper.warp_images(images, cameras)
+    warped_final_masks = warper.create_and_warp_masks(final_sizes, cameras)
+    final_corners, final_sizes = warper.warp_rois(final_sizes, cameras)
+    print("Final Corners:", final_corners)
+    print("Final Sizes:", final_sizes)
+    if debug:
+        warped_final_imgs = list(warped_final_imgs)
+        warped_final_masks = list(warped_final_masks)
+        fig, axs = plt.subplots(2, len(warped_final_imgs), figsize=(15, 10), num='Warped Images and Masks')
+        for col, (img, mask) in enumerate(zip(warped_final_imgs, warped_final_masks)):
+            axs[0, col].imshow(cv.cvtColor(img, cv.COLOR_BGR2RGB))
+            axs[0, col].set_title(f'Image {col+1}', fontsize=8)
+            axs[0, col].axis('off')
+            axs[1, col].imshow(mask, cmap='gray')
+            axs[1, col].set_title(f'Mask {col+1}', fontsize=8)
+            axs[1, col].axis('off')
+
         plt.tight_layout()
         plt.show(block=False)
 
+    return warped_final_imgs, warped_final_masks, final_corners, final_sizes
+
+
+def timelapse_images(warped_final_imgs, final_corners, final_sizes, debug=False):
+    from stitching.timelapser import Timelapser
+
+    timelapser = Timelapser('as_is')
+    timelapser.initialize(final_corners, final_sizes)
+
+    if debug:
+        fig, axs = plt.subplots(len(warped_final_imgs), 1, figsize=(10, 20), num='Timelapse Frames')
+        for row, (img, corner) in enumerate(zip(warped_final_imgs, final_corners)):
+            timelapser.process_frame(img, corner)
+            frame = timelapser.get_frame()
+            axs[row].imshow(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
+            axs[row].set_title(f'Frame {row+1}', fontsize=8)
+            axs[row].axis('off')
+        plt.tight_layout()
+        plt.show(block=False)
+
+
+def crop_images(warped_final_imgs, warped_final_masks, final_corners, final_sizes, debug=False):
+    from stitching.cropper import Cropper
+
+    cropper = Cropper()
+    mask = cropper.estimate_panorama_mask(warped_final_imgs, warped_final_masks, final_corners, final_sizes)
+    lir = cropper.estimate_largest_interior_rectangle(mask)
+
+    if debug: 
+        plot = lir.draw_on(mask, size=2)
+        plot_image(plot, (5,5), "Mask with LIR")
+
+    cropper.prepare(warped_final_imgs, warped_final_masks, final_corners, final_sizes)
+    cropped_final_masks = list(cropper.crop_images(warped_final_masks))
+    cropped_final_imgs = list(cropper.crop_images(warped_final_imgs))
+    final_corners, final_sizes = cropper.crop_rois(final_corners, final_sizes)
+
+    if debug:
+        from stitching.timelapser import Timelapser
+        timelapser = Timelapser('as_is')
+        timelapser.initialize(final_corners, final_sizes)
+
+        fig, axs = plt.subplots(len(cropped_final_imgs), 1, figsize=(10, 20), num='Final Cropped Images')
+        for row, (img, corner) in enumerate(zip(cropped_final_imgs, final_corners)):
+            timelapser.process_frame(img, corner)
+            frame = timelapser.get_frame()
+            axs[row].imshow(cv.cvtColor(frame, cv.COLOR_BGR2RGB))
+            axs[row].set_title(f'Image {row+1}', fontsize=8)
+            axs[row].axis('off')
+        plt.tight_layout()
+        plt.show(block=False)
+
+    return cropped_final_imgs, cropped_final_masks, final_corners, final_sizes
+
+
+def seam_images(cropped_imgs, cropped_masks, cropped_corners, cropped_sizes, debug=False):
+    from stitching.seam_finder import SeamFinder
+
+    seam_finder = SeamFinder()
+    seam_masks = seam_finder.find(cropped_imgs, cropped_corners, cropped_masks)
+    # seam_masks = [seam_finder.resize(seam_mask, mask) for seam_mask, mask in zip(seam_masks, cropped_masks)]
+
+    seam_masks_plots = [SeamFinder.draw_seam_mask(img, seam_mask) for img, seam_mask in zip(cropped_imgs, seam_masks)]
+    if debug:
+        plot_images(seam_masks_plots, (15, 10), 'Seam Masks')
+    return seam_masks
+
+def blend_images(cropped_imgs, seam_masks, cropped_corners, cropped_sizes, debug=False):
+    from stitching.blender import Blender
+
+    blender = Blender()
+    blender.prepare(cropped_corners, cropped_sizes)
+    for img, mask, corner in zip(cropped_imgs, seam_masks, cropped_corners):
+        blender.feed(img, mask, corner)
+    panorama, _ = blender.blend()
+    if debug:
+        plot_image(panorama, (10, 10), 'Final Panorama')
+    return panorama
+
 if __name__ == "__main__":
-    img_paths = get_image_paths('weir')
-    imgs = [cv.imread(img_path) for img_path in img_paths]
 
-    plot_images(img_paths, (20, 10), 'Original Images')
 
-    features = detect_features(imgs, debug=True)
+    weir_imgs = get_image_paths('weir')
+    images = Images.of(weir_imgs)
 
-    match_features(imgs, features, debug=True)
+    plot_images(weir_imgs, (20, 20), 'Original Images')
 
+    features = detect_features(images, debug=True)
+
+    matches = match_features(images, features, debug=True)
+
+    subset_images(images, features, matches)
+
+    cameras = estimate_cameras(features, matches)
+
+    warped_final_imgs, warped_final_masks, final_corners, final_sizes = warp_images(images, cameras, debug=True)
+
+    timelapse_images(warped_final_imgs, final_corners, final_sizes)
+
+    cropped_imgs, cropped_masks, cropped_corners, cropped_sizes = crop_images(warped_final_imgs, warped_final_masks, final_corners, final_sizes, debug=True)
+
+    seam_masks = seam_images(cropped_imgs, cropped_masks, cropped_corners, cropped_sizes, debug=True)
+
+    panorama = blend_images(cropped_imgs, seam_masks, cropped_corners, cropped_sizes, debug=True)
 
     plt.show(block=True)
